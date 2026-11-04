@@ -16,6 +16,14 @@ from docx import Document
 
 PROJECT_DIR = Path(__file__).resolve().parent
 
+import sys
+
+if str(PROJECT_DIR) not in sys.path:
+    sys.path.insert(0, str(PROJECT_DIR))
+
+from validation import find_placeholders
+
+
 LOG_DIR = PROJECT_DIR / "logs"
 OUTPUT_DIR = PROJECT_DIR / "outputs"
 
@@ -167,6 +175,12 @@ def build_app():
         disabled=True
     )
 
+    pdf_export_button = widgets.Button(
+        description="Export PDF",
+        button_style="success",
+        disabled=True
+    )
+
     status = widgets.HTML(
         "<b>Status:</b> Ready"
     )
@@ -175,6 +189,14 @@ def build_app():
     review_output = widgets.Output()
     improved_output = widgets.Output()
     export_output = widgets.Output()
+
+    final_editor = widgets.Textarea(
+        description="Final Draft:",
+        placeholder="Edit your final draft here.",
+        rows=12,
+        layout=widgets.Layout(width="100%"),
+        style={"description_width": "initial"}
+    )
 
 
     # ========================================
@@ -215,15 +237,27 @@ def build_app():
         )
 
         final_draft_exists = bool(
-            state["improved_draft"] or state["draft"]
+            final_editor.value.strip()
         )
 
         export_button.disabled = not (
             final_draft_exists and approve_checkbox.value
         )
+        pdf_export_button.disabled = not (
+            final_draft_exists and approve_checkbox.value
+        )
 
     approve_checkbox.observe(
         update_controls,
+        names="value"
+    )
+
+    def on_final_draft_change(change):
+        approve_checkbox.value = False
+        update_controls()
+
+    final_editor.observe(
+        on_final_draft_change,
         names="value"
     )
 
@@ -245,6 +279,7 @@ def build_app():
         state["draft"] = ""
         state["review"] = ""
         state["improved_draft"] = ""
+        final_editor.value = ""
 
         approve_checkbox.value = False
 
@@ -271,7 +306,14 @@ def build_app():
         Length: {length_dropdown.value}
 
         Make the content clear, relevant and well structured.
-        Do not invent missing facts.
+
+        Never invent dates, times, locations, names,
+        prices or contact details.
+
+        If information is missing, use placeholders:
+        [Date], [Time], [Location], [Contact Details].
+
+        Do not assume or create missing information.
         """
 
         generate_button.disabled = True
@@ -283,6 +325,7 @@ def build_app():
         try:
 
             state["draft"] = call_gemini(prompt)
+            final_editor.value = state["draft"]
 
             with draft_output:
                 display(Markdown(state["draft"]))
@@ -339,6 +382,21 @@ def build_app():
         {state["draft"]}
 
         Provide an overall assessment and suggestions.
+
+        Compare explicit and implied factual details
+        against the original user requirements.
+
+        Flag unsupported dates, times, locations, names,
+        prices, contact details and assumptions about
+        the time of day.
+
+        A weekend does not automatically mean afternoon
+        or evening.
+
+        Check whether the book title and author are supplied.
+        If missing, recommend [Book Title] and [Author].
+
+        Do not approve unsupported assumptions.
         """
 
         review_button.disabled = True
@@ -390,10 +448,26 @@ def build_app():
 
         Improve the original draft using the review feedback.
 
-        Preserve the original purpose.
-        Correct writing problems.
+        Preserve the original purpose and friendly tone.
+
+        Apply all necessary corrections from the review.
+
+        Remove unsupported assumptions, including
+        references to a specific time of day when none
+        was provided.
+
+        If the book title and author are missing, insert
+        [Book Title] and [Author] in the appropriate place.
+
+        Keep [Date], [Time], [Location] and
+        [Contact Details] unchanged.
+
         Do not invent facts.
-        Return only the improved content.
+
+        Do not add optional recommendations, such as
+        dietary reminders, unless specifically requested.
+
+        Return only the complete improved draft.
 
         Original topic:
         {topic_input.value}
@@ -414,6 +488,7 @@ def build_app():
         try:
 
             state["improved_draft"] = call_gemini(prompt)
+            final_editor.value = state["improved_draft"]
 
             approve_checkbox.value = False
 
@@ -449,9 +524,9 @@ def build_app():
 
     def export_document(button):
 
-        final_text = (
-            state["improved_draft"] or state["draft"]
-        )
+        import re
+
+        final_text = final_editor.value.strip()
 
         if not final_text:
             status.value = (
@@ -459,9 +534,62 @@ def build_app():
             )
             return
 
+        # Check for unfinished placeholders
+        # Detect unfinished placeholders
+        placeholders = []
+        remaining_text = final_text
+
+        while True:
+            opening = remaining_text.find("[")
+
+            if opening == -1:
+                break
+
+            closing = remaining_text.find("]", opening + 1)
+
+            if closing == -1:
+                break
+
+            item = remaining_text[opening:closing + 1]
+
+            if item[1:-1].strip():
+                placeholders.append(item)
+
+            remaining_text = remaining_text[closing + 1:]
+
+        placeholders = list(dict.fromkeys(placeholders))
+
+
+        placeholders = find_placeholders(final_text)
+
+        if placeholders:
+
+            missing_items = list(dict.fromkeys(placeholders))
+
+            logger.warning(
+                "Document export blocked. Missing placeholders: %s",
+                ", ".join(missing_items)
+            )
+
+            approve_checkbox.value = False
+
+            with export_output:
+                clear_output(wait=True)
+                print("EXPORT BLOCKED")
+                print("Please complete these details:")
+                for item in missing_items:
+                    print("-", item)
+
+            status.value = (
+                "<b>Status:</b> Export blocked. "
+                "Please complete all placeholders."
+            )
+            return
+
         if not approve_checkbox.value:
             status.value = (
-                "<b>Status:</b> Please approve the draft first."
+                "<b>Status:</b> Please review and approve "
+                "the final draft first."
             )
             return
 
@@ -490,14 +618,16 @@ def build_app():
 
             document.save(file_path)
 
-            logger.info("Word document saved successfully")
+            logger.info(
+                "Word document saved successfully: %s",
+                file_path.name
+            )
 
             with export_output:
                 clear_output(wait=True)
                 print("Document saved:", file_path)
 
             from google.colab import files
-
             files.download(str(file_path))
 
             logger.info("Word document download requested")
@@ -507,7 +637,6 @@ def build_app():
             )
 
         except Exception:
-
             logger.exception("Word export failed")
 
             status.value = (
@@ -515,15 +644,317 @@ def build_app():
                 "Please try again."
             )
 
-
     # ========================================
     # 11. CONNECT BUTTONS
     # ========================================
+
+    # ========================================
+    # PDF EXPORT
+    # ========================================
+
+    def export_pdf(button):
+
+        import re
+        import subprocess
+        import tempfile
+        import shutil
+
+        final_text = final_editor.value.strip()
+
+        if not final_text:
+            status.value = "<b>Status:</b> No draft available."
+            return
+
+        # Check for unfinished placeholders
+        # Detect unfinished placeholders
+        placeholders = []
+        remaining_text = final_text
+
+        while True:
+            opening = remaining_text.find("[")
+
+            if opening == -1:
+                break
+
+            closing = remaining_text.find("]", opening + 1)
+
+            if closing == -1:
+                break
+
+            item = remaining_text[opening:closing + 1]
+
+            if item[1:-1].strip():
+                placeholders.append(item)
+
+            remaining_text = remaining_text[closing + 1:]
+
+        placeholders = list(dict.fromkeys(placeholders))
+
+
+        placeholders = find_placeholders(final_text)
+
+        if placeholders:
+
+            missing = list(dict.fromkeys(placeholders))
+
+            with export_output:
+                clear_output(wait=True)
+                print("PDF EXPORT BLOCKED")
+                print("Complete these placeholders:")
+                for item in missing:
+                    print("-", item)
+
+            logger.warning("PDF export blocked by placeholders")
+
+            status.value = (
+                "<b>Status:</b> Complete all placeholders first."
+            )
+            return
+
+        if not approve_checkbox.value:
+            status.value = (
+                "<b>Status:</b> Please approve the final draft first."
+            )
+            return
+
+        converter = (
+            shutil.which("libreoffice")
+            or shutil.which("soffice")
+        )
+
+        if not converter:
+            status.value = (
+                "<b>Error:</b> LibreOffice is not installed. "
+                "Please install the PDF conversion tool."
+            )
+            logger.error("LibreOffice PDF converter unavailable")
+            return
+
+        try:
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+            pdf_path = OUTPUT_DIR / (
+                f"final_draft_{timestamp}.pdf"
+            )
+
+            # Create temporary Word file for conversion
+            with tempfile.TemporaryDirectory(
+                dir=str(OUTPUT_DIR)
+            ) as temporary_folder:
+
+                temporary_docx = (
+                    Path(temporary_folder)
+                    / f"final_draft_{timestamp}.docx"
+                )
+
+                document = Document()
+
+                document.add_heading(
+                    "AI Writing Assistant - Final Draft",
+                    level=1
+                )
+
+                document.add_paragraph(
+                    "Topic: " + topic_input.value.strip()
+                )
+
+                document.add_paragraph(final_text)
+
+                document.save(temporary_docx)
+
+                # Convert Word document to PDF
+                result = subprocess.run(
+                    [
+                        converter,
+                        "--headless",
+                        "--convert-to",
+                        "pdf",
+                        "--outdir",
+                        str(OUTPUT_DIR),
+                        str(temporary_docx)
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=120,
+                    check=True
+                )
+
+            if not pdf_path.exists() or pdf_path.stat().st_size == 0:
+                raise RuntimeError(
+                    "PDF conversion did not create a valid file. "
+                    + result.stderr
+                )
+
+            logger.info("PDF document saved successfully: %s",
+                        pdf_path.name)
+
+            with export_output:
+                clear_output(wait=True)
+                print("PDF saved successfully:")
+                print(pdf_path)
+
+            from google.colab import files
+            files.download(str(pdf_path))
+
+            logger.info("PDF download requested")
+
+            status.value = (
+                "<b>Status:</b> PDF exported successfully."
+            )
+
+        except Exception:
+            logger.exception("PDF export failed")
+
+            status.value = (
+                "<b>Error:</b> PDF export failed. "
+                "Please check the application log."
+            )
+
 
     generate_button.on_click(generate_draft)
     review_button.on_click(review_draft)
     improve_button.on_click(improve_draft)
     export_button.on_click(export_document)
+    pdf_export_button.on_click(export_pdf)
+
+
+
+    # ========================================
+    # DOCUMENT ANALYTICS DASHBOARD
+    # ========================================
+
+    import html as html_lib
+
+    dashboard_display = widgets.HTML()
+    refresh_dashboard_button = widgets.Button(
+        description="Refresh Dashboard",
+        icon="refresh",
+        button_style="info"
+    )
+
+    def refresh_dashboard(_=None):
+
+        log_file = LOG_DIR / "app.log"
+
+        if not log_file.exists():
+            dashboard_display.value = "<p>No application log found.</p>"
+            return
+
+        log_lines = log_file.read_text(
+            encoding="utf-8",
+            errors="replace"
+        ).splitlines()
+
+        messages = []
+
+        for line in log_lines:
+            parts = line.split(" | ", 2)
+
+            if len(parts) == 3:
+                messages.append({
+                    "timestamp": parts[0],
+                    "level": parts[1],
+                    "message": parts[2]
+                })
+
+        def count_events(prefix):
+            return sum(
+                1 for item in messages
+                if item["message"].startswith(prefix)
+            )
+
+        generated = count_events("Draft generated successfully")
+        reviewed = count_events("Draft review completed")
+        improved = count_events("Draft improvement completed")
+        word_exports = count_events("Word document saved successfully")
+        pdf_exports = count_events("PDF document saved successfully")
+
+        blocked = (
+            count_events("Document export blocked")
+            + count_events("PDF export blocked")
+        )
+
+        cards = [
+            ("Drafts Generated", generated),
+            ("Drafts Reviewed", reviewed),
+            ("Drafts Improved", improved),
+            ("Word Exports", word_exports),
+            ("PDF Exports", pdf_exports),
+            ("Blocked Exports", blocked)
+        ]
+
+        cards_html = ""
+
+        for label, value in cards:
+            cards_html += f"""
+            <div style="
+                border:1px solid #888;
+                border-radius:10px;
+                padding:14px;
+                min-width:125px;
+                flex:1;
+                margin:4px;
+            ">
+                <div style="font-size:25px;font-weight:bold;">
+                    {value}
+                </div>
+                <div style="font-size:13px;">
+                    {label}
+                </div>
+            </div>
+            """
+
+        recent_html = ""
+
+        for item in reversed(messages[-8:]):
+            timestamp = html_lib.escape(item["timestamp"])
+            level = html_lib.escape(item["level"])
+            message = html_lib.escape(item["message"])
+
+            recent_html += f"""
+            <div style="
+                padding:8px 4px;
+                border-bottom:1px solid #888;
+                font-size:13px;
+            ">
+                <b>{timestamp}</b> | {level}<br>
+                {message}
+            </div>
+            """
+
+        if not recent_html:
+            recent_html = "<p>No activity recorded yet.</p>"
+
+        dashboard_display.value = f"""
+        <div style="margin:12px 0;">
+            <h3>Document Analytics Dashboard</h3>
+
+            <div style="
+                display:flex;
+                flex-wrap:wrap;
+                margin:0 -4px;
+            ">
+                {cards_html}
+            </div>
+
+            <h4>Recent Activity (Last 8 Events)</h4>
+            {recent_html}
+
+            <p style="font-size:12px;opacity:0.7;">
+                Last refreshed: {datetime.now().strftime("%d-%m-%Y %H:%M:%S")}
+            </p>
+        </div>
+        """
+
+    refresh_dashboard_button.on_click(refresh_dashboard)
+
+    refresh_dashboard()
+
+    dashboard_section = widgets.VBox([
+        widgets.HTML("<h2>Application Dashboard</h2>"),
+        refresh_dashboard_button,
+        dashboard_display
+    ])
 
 
     # ========================================
@@ -532,6 +963,7 @@ def build_app():
 
     interface = widgets.VBox([
 
+        dashboard_section,
         title,
 
         topic_input,
@@ -555,8 +987,14 @@ def build_app():
         widgets.HTML("<h3>Improved Draft</h3>"),
         improved_output,
 
+        widgets.HTML("<h3>Edit Your Final Draft</h3>"),
+        final_editor,
+
         approve_checkbox,
-        export_button,
+        widgets.HBox([
+            export_button,
+            pdf_export_button
+        ]),
 
         export_output,
         status

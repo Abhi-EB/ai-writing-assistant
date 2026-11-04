@@ -6,15 +6,16 @@ secrets.json
 
 # Python temporary files
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 
-# Application logs
-logs/
+# Logs (keep folder placeholder only)
+logs/*
+!logs/.gitkeep
 *.log
 
-# Generated documents and personal content
-outputs/
+# Generated documents (keep folder placeholder only)
+outputs/*
+!outputs/.gitkeep
 *.docx
 *.pdf
 
